@@ -179,6 +179,53 @@ IMPORTANT: Choose parameters based on the severity shown in metrics. For example
 - Contrast pixel_range of 90 → needs mild contrast boost
 """
 
+METRIC_DECISION_WITH_QUESTION_PROMPT_TEMPLATE = """You are an image recovery expert. Your job is to analyze image quality metrics and decide if and how to improve the image FOR A SPECIFIC TASK.
+
+## Task Context
+The image will be used to answer this question:
+{question}
+
+## Current Image Metrics
+{metrics_formatted}
+
+## Available Recovery Tools
+{tool_descriptions}
+
+## Your Task
+Based on the metrics AND the question:
+1. Identify which metrics indicate problems (compare to reference values)
+2. Consider what parts of the image are most important for answering the question
+3. Decide if recovery is needed and prioritize accordingly
+4. If yes, select ONE tool and specify its parameters
+
+### Decision Guidelines
+- **Sharpness < 500**: Image is blurry, consider sharpen/unsharp_mask/high_pass_sharpen
+- **Contrast pixel_range < 100**: Low contrast, consider auto_contrast/contrast_adjust
+- **Brightness mean < 50 or > 200**: Exposure issues, consider brightness_adjust/gamma_correction
+- **Noise > 20**: Noisy image, consider median_filter/gaussian_smooth/bilateral_filter
+- **Saturation mean < 0.15**: Desaturated, consider saturation_adjust
+- **JPEG artifacts > 15**: Compression artifacts, consider deblock
+
+### Task-Aware Prioritization
+- If question asks about TEXT (signs, labels, numbers): prioritize sharpening
+- If question asks about COLORS: prioritize contrast/saturation recovery
+- If question asks about DETAILS (small objects): prioritize sharpening and noise reduction
+- If question asks about OVERALL SCENE: balance all metrics
+
+Respond in JSON format:
+```json
+{{
+    "needs_recovery": true|false,
+    "primary_issue": "blur|contrast|brightness|noise|saturation|jpeg_artifacts|none",
+    "selected_tool": "tool_name or none",
+    "parameters": {{
+        "param1": value1
+    }},
+    "reasoning": "why this tool with these parameters based on the metrics AND the question"
+}}
+```
+"""
+
 METRIC_VERIFICATION_PROMPT_TEMPLATE = """You are evaluating if the image recovery was successful by comparing metrics.
 
 ## BEFORE Recovery
@@ -632,6 +679,27 @@ class RecoveryStep:
     image_after_hash: str
     metrics_before: Optional[Dict] = None
     metrics_after: Optional[Dict] = None
+    # For full trace
+    vlm_decision_prompt: Optional[str] = None
+    vlm_decision_response: Optional[str] = None
+    vlm_verify_prompt: Optional[str] = None
+    vlm_verify_response: Optional[str] = None
+
+    def to_trace_dict(self) -> Dict[str, Any]:
+        """Convert to dict for trace saving (excludes image hashes)."""
+        return {
+            "step_number": self.step_number,
+            "tool_name": self.tool_name,
+            "parameters": self.parameters,
+            "reasoning": self.reasoning,
+            "improvement": self.improvement,
+            "metrics_before": self.metrics_before,
+            "metrics_after": self.metrics_after,
+            "vlm_decision_prompt": self.vlm_decision_prompt,
+            "vlm_decision_response": self.vlm_decision_response,
+            "vlm_verify_prompt": self.vlm_verify_prompt,
+            "vlm_verify_response": self.vlm_verify_response,
+        }
 
 
 @dataclass
@@ -647,6 +715,27 @@ class RecoveryResult:
     stop_reason: str
     initial_metrics: Optional[Dict] = None
     final_metrics: Optional[Dict] = None
+
+    def to_trace_dict(self) -> Dict[str, Any]:
+        """Export full trace as dict (for saving to JSON).
+
+        Does NOT include images - only the tool calls and metrics.
+        Images can be reconstructed by replaying the tool calls.
+        """
+        return {
+            "initial_metrics": self.initial_metrics,
+            "final_metrics": self.final_metrics,
+            "final_quality": self.final_quality,
+            "total_steps": self.total_steps,
+            "early_stopped": self.early_stopped,
+            "stop_reason": self.stop_reason,
+            "steps": [step.to_trace_dict() for step in self.steps_taken],
+            # Tool call sequence for easy replay
+            "tool_sequence": [
+                {"tool": step.tool_name, "params": step.parameters}
+                for step in self.steps_taken
+            ],
+        }
 
 
 class RecoveryAgent:
@@ -962,13 +1051,14 @@ class RecoveryAgent:
     def recover_with_metrics(
         self,
         image: Image.Image,
-        max_iterations: int = 5
+        max_iterations: int = 5,
+        question: str = None
     ) -> RecoveryResult:
         """Run metric-based recovery loop.
 
         New workflow:
         1. Compute all image quality metrics
-        2. Send metrics + image to VLM
+        2. Send metrics + image to VLM (optionally with question for task-aware recovery)
         3. VLM decides tool + parameters based on metrics
         4. Apply tool
         5. Re-compute metrics
@@ -978,6 +1068,7 @@ class RecoveryAgent:
         Args:
             image: Input image to recover
             max_iterations: Maximum recovery iterations (default: 5)
+            question: Optional question/task context for task-aware recovery
 
         Returns:
             RecoveryResult with recovered image, metrics, and metadata
@@ -1004,11 +1095,18 @@ class RecoveryAgent:
             # Format metrics for VLM
             metrics_formatted = format_metrics_for_vlm(current_metrics)
 
-            # Ask VLM for decision
-            prompt = METRIC_DECISION_PROMPT_TEMPLATE.format(
-                metrics_formatted=metrics_formatted,
-                tool_descriptions=self.tool_registry.get_tool_descriptions_for_vlm()
-            )
+            # Ask VLM for decision (use question-aware prompt if question provided)
+            if question:
+                prompt = METRIC_DECISION_WITH_QUESTION_PROMPT_TEMPLATE.format(
+                    question=question,
+                    metrics_formatted=metrics_formatted,
+                    tool_descriptions=self.tool_registry.get_tool_descriptions_for_vlm()
+                )
+            else:
+                prompt = METRIC_DECISION_PROMPT_TEMPLATE.format(
+                    metrics_formatted=metrics_formatted,
+                    tool_descriptions=self.tool_registry.get_tool_descriptions_for_vlm()
+                )
 
             self._log("Asking VLM for recovery decision...")
             response = self.vlm_client.analyze_image(current_image, prompt)
@@ -1053,6 +1151,8 @@ class RecoveryAgent:
             self._log(f"  Noise: {metrics_before['noise']} → {metrics_after['noise']}")
 
             # Ask VLM to verify improvement
+            verify_prompt = None
+            verify_response = None
             if self.verify_improvements:
                 verify_prompt = METRIC_VERIFICATION_PROMPT_TEMPLATE.format(
                     metrics_before=format_metrics_for_vlm(metrics_before),
@@ -1071,7 +1171,7 @@ class RecoveryAgent:
                 improvement = "assumed"
                 continue_recovery = True
 
-            # Record step
+            # Record step (with full trace info)
             steps.append(RecoveryStep(
                 step_number=iteration + 1,
                 tool_name=tool_name,
@@ -1081,7 +1181,11 @@ class RecoveryAgent:
                 image_before_hash=before_hash,
                 image_after_hash=after_hash,
                 metrics_before=metrics_before,
-                metrics_after=metrics_after
+                metrics_after=metrics_after,
+                vlm_decision_prompt=prompt,
+                vlm_decision_response=response,
+                vlm_verify_prompt=verify_prompt,
+                vlm_verify_response=verify_response,
             ))
 
             # Update current image and metrics if improvement detected
