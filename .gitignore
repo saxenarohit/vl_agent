@@ -1,0 +1,39 @@
+# Plan files
+plan.md
+
+# SLURM scripts and logs
+slurm/
+logs/
+*.out
+*.err
+
+# Test images and output
+test_images/
+output/
+*.png
+*.jpg
+*.jpeg
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+
+# Environment
+.env
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
