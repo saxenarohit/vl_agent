@@ -31,8 +31,20 @@ import numpy as np
 # Add code directory to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Add robustbench code directory for augmentation utilities
+sys.path.insert(0, "/workspace-vast/rohits/exp/robustbench/code")
+
 from recovery_agent import create_recovery_agent, create_vlm_client
 from recovery_tools import get_all_metrics
+
+# Import augmentation utilities from robustbench
+try:
+    from infer_utils import make_augmenter, parse_aug_params
+    import aug
+    HAS_AUG = True
+except ImportError:
+    HAS_AUG = False
+    print("Warning: Could not import augmentation utilities from robustbench")
 
 
 # ============================================================================
@@ -82,7 +94,11 @@ def apply_stratified_sampling(
     stratify_field: str = "subject",
     seed: int = 42
 ) -> Any:
-    """Apply stratified sampling (matching robustbench)."""
+    """Apply stratified sampling (matching robustbench exactly).
+
+    This function mirrors robustbench's apply_sampling() to ensure
+    identical sample selection with the same seed.
+    """
     rng = np.random.default_rng(seed)
     target_n = int(len(dataset) * sample_ratio)
 
@@ -97,16 +113,21 @@ def apply_stratified_sampling(
         cat = sample.get(stratify_field, 'unknown')
         cat_indices[cat].append(idx)
 
-    # Sample proportionally from each category
+    # Sample proportionally from each category (matching robustbench)
     selected_indices = []
-    for cat, indices in sorted(cat_indices.items()):
+    for cat, indices in cat_indices.items():  # Dict order, not sorted
+        # Proportional allocation
         cat_n = max(1, int(len(indices) / len(dataset) * target_n))
-        if len(indices) < cat_n:
-            cat_n = len(indices)
+        cat_n = min(cat_n, len(indices))
         sampled = rng.choice(indices, size=cat_n, replace=False).tolist()
         selected_indices.extend(sampled)
 
-    rng.shuffle(selected_indices)
+    # Trim if over target (matching robustbench)
+    if len(selected_indices) > target_n:
+        selected_indices = rng.choice(selected_indices, size=target_n, replace=False).tolist()
+
+    # Sort by index before selection (matching robustbench)
+    selected_indices = sorted(selected_indices)
     sampled_dataset = dataset.select(selected_indices)
     print(f"  Final sample count: {len(sampled_dataset)}")
 
@@ -138,13 +159,23 @@ def replace_images_tokens(input_string):
 
 
 def extract_images_from_sample(sample: Dict, variant: str) -> List[Image.Image]:
-    """Extract all images from a dataset sample."""
+    """Extract all images from a dataset sample (matching robustbench).
+
+    Robustbench extracts image tokens from question + options combined,
+    since some samples have <image N> tokens in options (e.g., when images
+    are answer choices).
+    """
     images = []
 
     if "standard" in variant:
-        # Standard variant: look for image_1, image_2, etc. based on question tokens
+        # Standard variant: look for image_1, image_2, etc. based on tokens
+        # in question AND options (matching robustbench behavior)
         question = sample.get("question", "")
-        image_order = [int(num) for num in re.findall(r"<image\s+(\d+)>", question)]
+        options = sample.get("options", "")
+        combined_text = f"{question}\n{options}"
+
+        image_order = [int(num) for num in re.findall(r"<image\s+(\d+)>", combined_text)]
+
         for idx in image_order:
             img_key = f"image_{idx}"
             if img_key in sample and sample[img_key] is not None:
@@ -225,7 +256,7 @@ def save_results_jsonl(results: List[Dict], output_path: str):
 def setup_output_path(args) -> str:
     """Setup output path matching robustbench structure.
 
-    Structure: output_dir/{model_name}/MMMU_Pro/{variant}_{mode}_{recovery}.jsonl
+    Structure: output_dir/{model_name}/MMMU_Pro/{variant}_{mode}_{aug}_{recovery}.jsonl
     """
     model_name = args.model.split("/")[-1] if args.model else args.provider
 
@@ -233,6 +264,15 @@ def setup_output_path(args) -> str:
         variant = "standard"
     else:
         variant = "vision"
+
+    # Build augmentation suffix
+    if args.aug and args.aug != "none":
+        if args.severity:
+            aug_str = f"{args.aug}_sev{args.severity}"
+        else:
+            aug_str = args.aug
+    else:
+        aug_str = "none"
 
     # Build recovery suffix
     if args.enable_recovery:
@@ -243,7 +283,7 @@ def setup_output_path(args) -> str:
     else:
         recovery_str = "none"
 
-    filename = f"{variant}_{args.mode}_{recovery_str}.jsonl"
+    filename = f"{variant}_{args.mode}_{aug_str}_{recovery_str}.jsonl"
     output_path = os.path.join(args.output_dir, model_name, "MMMU_Pro", filename)
 
     return output_path
@@ -262,6 +302,7 @@ def run_evaluation(
     enable_recovery: bool = False,
     recovery_with_question: bool = False,
     recovery_max_iter: int = 5,
+    augmenter=None,
     save_traces: bool = False,
     trace_dir: str = None,
     verbose: bool = True
@@ -293,6 +334,12 @@ def run_evaluation(
         if not images:
             print(f"[{idx+1}/{total}] No images found, skipping")
             continue
+
+        # Apply augmentation if specified (before recovery)
+        if augmenter is not None:
+            images = augmenter(images, idx)
+            # Ensure images are still RGB PIL Images after augmentation
+            images = [img.convert('RGB') if isinstance(img, Image.Image) else Image.fromarray(img).convert('RGB') for img in images]
 
         ground_truth = sample.get("answer", "").strip().upper()
 
@@ -470,11 +517,21 @@ def main():
     parser.add_argument("--recovery_with_question", action="store_true",
                         help="Pass question to recovery agent for task-aware recovery")
 
+    # Augmentation arguments (matching robustbench)
+    parser.add_argument("--aug", type=str, default="none",
+                        help="Augmentation to apply (e.g., gaussian_blur, fog, jpeg_compression)")
+    parser.add_argument("--severity", type=int, default=None, choices=[1, 2, 3, 4, 5],
+                        help="Severity level 1-5 for augmentation")
+    parser.add_argument("--aug_seed", type=int, default=1234,
+                        help="Seed for deterministic augmentation")
+
     # Dataset arguments
     parser.add_argument("--variant", type=str, default="standard (10 options)",
                         help="MMMU_Pro variant")
     parser.add_argument("--sample_ratio", type=float, default=0.2,
                         help="Sampling ratio (default: 0.2)")
+    parser.add_argument("--num_samples", type=int, default=None,
+                        help="Limit to first N samples (after stratified sampling)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
 
@@ -494,6 +551,7 @@ def main():
     print(f"Provider: {args.provider}")
     print(f"Model: {args.model or 'default'}")
     print(f"Mode: {args.mode}")
+    print(f"Augmentation: {args.aug}" + (f" (severity {args.severity})" if args.severity else ""))
     print(f"Recovery: {'enabled' if args.enable_recovery else 'disabled'}")
     if args.enable_recovery:
         print(f"  - With question: {'yes' if args.recovery_with_question else 'no'}")
@@ -501,6 +559,13 @@ def main():
     print(f"Sample ratio: {args.sample_ratio}")
     print(f"Seed: {args.seed}")
     print("=" * 60)
+
+    # Create augmenter if needed
+    augmenter = None
+    if args.aug != "none" and HAS_AUG:
+        aug_params = {'severity': args.severity} if args.severity else {}
+        augmenter = make_augmenter(args.aug, aug_params, args.aug_seed)
+        print(f"Augmenter created: {args.aug} severity={args.severity}")
 
     # Load dataset
     dataset = load_mmmu_pro(variant=args.variant)
@@ -512,6 +577,11 @@ def main():
             sample_ratio=args.sample_ratio,
             seed=args.seed
         )
+
+    # Limit to first N samples if specified
+    if args.num_samples and args.num_samples < len(dataset):
+        dataset = dataset.select(range(args.num_samples))
+        print(f"Limited to first {args.num_samples} samples")
 
     # Create VLM client
     print(f"\nCreating VLM client...")
@@ -550,6 +620,7 @@ def main():
         enable_recovery=args.enable_recovery,
         recovery_with_question=args.recovery_with_question,
         recovery_max_iter=args.recovery_max_iter,
+        augmenter=augmenter,
         save_traces=args.save_traces,
         trace_dir=trace_dir,
         verbose=args.verbose
